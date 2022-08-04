@@ -1,10 +1,22 @@
 #!/usr/bin/env groovy
+Jenkinsfile (Declarative Pipeline)
 pipeline {
-    agent any 
+    agent any
+
     stages {
-        stage('Stage 1') {
+        stage('Build') {
             steps {
-                echo 'Hello lorem collins build 3!' 
+                echo 'Building..'
+            }
+        }
+        stage('Test') {
+            steps {
+                echo 'Testing..'
+            }
+        }
+        stage('Deploy') {
+            steps {
+                echo 'Deploying....'
             }
         }
     }
