@@ -1,109 +1,171 @@
-// Example Jenkins pipeline with Cypress end-to-end tests running in parallel on 2 workers
-// Pipeline syntax from https://jenkins.io/doc/book/pipeline/
-
-// Setup:
-//  before starting Jenkins, I have created several volumes to cache
-//  Jenkins configuration, NPM modules and Cypress binary
-
-// docker volume create jenkins-data
-// docker volume create npm-cache
-// docker volume create cypress-cache
-
-// Start Jenkins command line by line:
-//  - run as "root" user (insecure, contact your admin to configure user and groups!)
-//  - run Docker in disconnected mode
-//  - name running container "blue-ocean"
-//  - map port 8080 with Jenkins UI
-//  - map volumes for Jenkins data, NPM and Cypress caches
-//  - pass Docker socket which allows Jenkins to start worker containers
-//  - download and execute the latest BlueOcean Docker image
-
-// docker run \
-//   -u root \
-//   -d \
-//   --name blue-ocean \
-//   -p 8080:8080 \
-//   -v jenkins-data:/var/jenkins_home \
-//   -v npm-cache:/root/.npm \
-//   -v cypress-cache:/root/.cache \
-//   -v /var/run/docker.sock:/var/run/docker.sock \
-//   jenkinsci/blueocean:latest
-
-// If you start for the very first time, inspect the logs from the running container
-// to see Administrator password - you will need it to configure Jenkins via localhost:8080 UI
-//    docker logs blue-ocean
-
 pipeline {
-  agent {
-    // this image provides everything needed to run Cypress
-    docker {
-      image 'cypress/base:10'
-    }
+  // The following pipeline provides an opinionated template you can customize for your own needs.
+  // 
+  // Instructions for configuring the Octopus plugin can be found at
+  // https://octopus.com/docs/packaging-applications/build-servers/jenkins#configure-the-octopus-deploy-plugin
+  // 
+  // Get a trial Octopus instance from https://octopus.com/start
+  // 
+  // This pipeline requires the following plugins:
+  // * Pipeline Utility Steps Plugin: https://wiki.jenkins.io/display/JENKINS/Pipeline+Utility+Steps+Plugin
+  // * Git: https://plugins.jenkins.io/git/
+  // * Workflow Aggregator: https://plugins.jenkins.io/workflow-aggregator/
+  // * Octopus Deploy: https://plugins.jenkins.io/octopusdeploy/.
+  parameters {
+    // Parameters are only available after the first run. See https://issues.jenkins.io/browse/JENKINS-41929 for more details.
+    string(defaultValue: 'Spaces-1', description: '', name: 'SpaceId', trim: true)
+    string(defaultValue: 'dockerJenkins', description: '', name: 'ProjectName', trim: true)
+    string(defaultValue: 'Dev', description: '', name: 'EnvironmentName', trim: true)
+    string(defaultValue: 'Octopus', description: '', name: 'ServerId', trim: true)
   }
-
+  agent 'any'
   stages {
-    // first stage installs node dependencies and Cypress binary
-    stage('build') {
+    stage('Environment') {
       steps {
-        // there a few default environment variables on Jenkins
-        // on local Jenkins machine (assuming port 8080) see
-        // http://localhost:8080/pipeline-syntax/globals#env
-        echo "Running build ${env.BUILD_ID} on ${env.JENKINS_URL}"
-        sh 'npm ci'
-        sh 'npm run cy:verify'
+          echo "PATH = ${env.PATH}"
       }
     }
-
-    stage('start local server') {
+    stage('Checkout') {
       steps {
-        // start local server in the background
-        // we will shut it down in "post" command block
-        sh 'nohup npm run start &'
-      }
-    }
-
-    // this stage runs end-to-end tests, and each agent uses the workspace
-    // from the previous stage
-    stage('cypress parallel tests') {
-      environment {
-        // we will be recording test results and video on Cypress dashboard
-        // to record we need to set an environment variable
-        // we can load the record key variable from credentials store
-        // see https://jenkins.io/doc/book/using/using-credentials/
-        CYPRESS_RECORD_KEY = credentials('cypress-example-kitchensink-record-key')
-        // because parallel steps share the workspace they might race to delete
-        // screenshots and videos folders. Tell Cypress not to delete these folders
-        CYPRESS_trashAssetsBeforeRuns = 'false'
-      }
-
-      // https://jenkins.io/doc/book/pipeline/syntax/#parallel
-      parallel {
-        // start several test jobs in parallel, and they all
-        // will use Cypress Dashboard to load balance any found spec files
-        stage('tester A') {
-          steps {
-            echo "Running build ${env.BUILD_ID}"
-            sh "npm run e2e:record:parallel"
-          }
-        }
-
-        // second tester runs the same command
-        stage('tester B') {
-          steps {
-            echo "Running build ${env.BUILD_ID}"
-            sh "npm run e2e:record:parallel"
-          }
+        // If this pipeline is saved as a Jenkinsfile in a git repo, the checkout stage can be deleted as
+        // Jenkins will check out the code for you.
+        script {
+            /*
+              This is from the Jenkins "Global Variable Reference" documentation:
+              SCM-specific variables such as GIT_COMMIT are not automatically defined as environment variables; rather you can use the return value of the checkout step.
+            */
+            def checkoutVars = checkout([$class: 'GitSCM', branches: [[name: '*/master']], userRemoteConfigs: [[url: 'https://github.com/collinsobasuyi/dockerJenkins.git']]])
+            env.GIT_URL = checkoutVars.GIT_URL
+            env.GIT_COMMIT = checkoutVars.GIT_COMMIT
+            env.GIT_BRANCH = checkoutVars.GIT_BRANCH
         }
       }
-
     }
-  }
-
-  post {
-    // shutdown the server running in the background
-    always {
-      echo 'Stopping local server'
-      sh 'pkill -f http-server'
+    stage('Dependencies') {
+      steps {
+        sh(script: 'npm install')
+        // Save the dependencies that went into this build into an artifact. This allows you to review any builds for vulnerabilities later on.
+        sh(script: 'npm list --all > dependencies.txt')
+        archiveArtifacts(artifacts: 'dependencies.txt', fingerprint: true)
+        // List any dependency updates.
+        sh(script: 'npm outdated > dependencieupdates.txt || true')
+        archiveArtifacts(artifacts: 'dependencieupdates.txt', fingerprint: true)
+      }
+    }
+    stage('Test') {
+      steps {
+        sh(script: 'npm test', returnStdout: true)
+        // The results should be processed and the pipeline
+        // passed or failed with a step like https://plugins.jenkins.io/junit/ or
+        // https://plugins.jenkins.io/xunit/ (depending on the report format). Dedicated
+        // test processing steps provide flexibility around test failure thresholds rather than
+        // simple pass/fail results.
+        // junit(testResults: 'report.xml', allowEmptyResults : true)
+      }
+    }
+    stage('Build') {
+      steps {
+        sh(script: 'npm run build', returnStdout: true)
+      }
+    }
+    stage('Package') {
+      steps {
+        // Gitversion is available from https://github.com/GitTools/GitVersion/releases.
+        // We attempt to run gitversion if the executable is available.
+        sh(script: 'which gitversion && gitversion /output buildserver || true')
+        // Capture the git version as an environment variable, or use a default version if gitversion wasn't available.
+        // https://gitversion.net/docs/reference/build-servers/jenkins
+        script {
+            if (fileExists('gitversion.properties')) {
+              def props = readProperties file: 'gitversion.properties'
+              env.VERSION_SEMVER = props.GitVersion_SemVer
+              env.VERSION_BRANCHNAME = props.GitVersion_BranchName
+              env.VERSION_ASSEMBLYSEMVER = props.GitVersion_AssemblySemVer
+              env.VERSION_MAJORMINORPATCH = props.GitVersion_MajorMinorPatch
+              env.VERSION_SHA = props.GitVersion_Sha
+            } else {
+              env.VERSION_SEMVER = "1.0.0." + env.BUILD_NUMBER
+            }
+        }
+        script {
+            def sourcePath = "."
+            def outputPath = "."
+            
+            if (fileExists("build")) {
+            	sourcePath = "build"
+            	outputPath = ".."
+            }
+            
+            octopusPack(
+            	additionalArgs: '',
+            	sourcePath: sourcePath,
+            	outputPath : outputPath,
+            	includePaths: "**/*.html\n**/*.htm\n**/*.css\n**/*.js\n**/*.min\n**/*.map\n**/*.sql\n**/*.png\n**/*.jpg\n**/*.jpeg\n**/*.gif\n**/*.json\n**/*.env\n**/*.txt\n**/Procfile",
+            	overwriteExisting: true, 
+            	packageFormat: 'zip', 
+            	packageId: 'dockerJenkins', 
+            	packageVersion: env.VERSION_SEMVER, 
+            	toolId: 'Default', 
+            	verboseLogging: false)
+            env.ARTIFACTS = "dockerJenkins.${env.VERSION_SEMVER}.zip"
+        }
+      }
+    }
+    stage('Deployment') {
+      steps {
+        // This stage assumes you perform the deployment with Octopus Deploy.
+        // The steps shown below can be replaced with your own custom steps to deploy to other platforms if needed.
+        octopusPushPackage(additionalArgs: '',
+          packagePaths: env.ARTIFACTS.split(":").join("\n"),
+          overwriteMode: 'OverwriteExisting',
+          serverId: params.ServerId,
+          spaceId: params.SpaceId,
+          toolId: 'Default')
+        octopusPushBuildInformation(additionalArgs: '',
+          commentParser: 'GitHub',
+          overwriteMode: 'OverwriteExisting',
+          packageId: env.ARTIFACTS.split(":")[0].substring(env.ARTIFACTS.split(":")[0].lastIndexOf("/") + 1, env.ARTIFACTS.split(":")[0].length()).replaceAll("\\." + env.VERSION_SEMVER + "\\..+", ""),
+          packageVersion: env.VERSION_SEMVER,
+          serverId: params.ServerId,
+          spaceId: params.SpaceId,
+          toolId: 'Default',
+          verboseLogging: false,
+          gitUrl: env.GIT_URL,
+          gitCommit: env.GIT_COMMIT,
+          gitBranch: env.GIT_BRANCH)
+        octopusCreateRelease(additionalArgs: '',
+          cancelOnTimeout: false,
+          channel: '',
+          defaultPackageVersion: '',
+          deployThisRelease: false,
+          deploymentTimeout: '',
+          environment: params.EnvironmentName,
+          jenkinsUrlLinkback: false,
+          project: params.ProjectName,
+          releaseNotes: false,
+          releaseNotesFile: '',
+          releaseVersion: env.VERSION_SEMVER,
+          serverId: params.ServerId,
+          spaceId: params.SpaceId,
+          tenant: '',
+          tenantTag: '',
+          toolId: 'Default',
+          verboseLogging: false,
+          waitForDeployment: false)
+        octopusDeployRelease(cancelOnTimeout: false,
+          deploymentTimeout: '',
+          environment: params.EnvironmentName,
+          project: params.ProjectName,
+          releaseVersion: env.VERSION_SEMVER,
+          serverId: params.ServerId,
+          spaceId: params.SpaceId,
+          tenant: '',
+          tenantTag: '',
+          toolId: 'Default',
+          variables: '',
+          verboseLogging: false,
+          waitForDeployment: true)
+      }
     }
   }
 }
